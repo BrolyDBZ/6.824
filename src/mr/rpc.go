@@ -25,7 +25,6 @@ type ExampleReply struct {
 }
 
 type GetTask struct {
-	WorkerId int
 }
 
 type ReplyTask struct {
@@ -37,11 +36,10 @@ type ReplyTask struct {
 }
 
 type SendTaskReport struct {
-	Status   bool
-	Files    []string
-	WorkerId int
-	TaskId   int
-	Type     string
+	Status bool
+	Files  []string
+	TaskId int
+	Type   string
 }
 
 type ReplyTaskReport struct {

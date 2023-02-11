@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -24,7 +25,6 @@ type Coordinator struct {
 
 type task struct {
 	files     []string `default:nil`
-	workerId  []int    `default:nil`
 	done      bool     `default:false`
 	timeStamp time.Time
 }
@@ -68,7 +68,6 @@ func (c *Coordinator) Done() bool {
 	c.mu.Unlock()
 	// Your code here.
 	if done {
-		// c.delIntermediateFiles()
 		ret = true
 	}
 
@@ -105,12 +104,21 @@ func (c *Coordinator) mapReport(taskId int, files []string) {
 		mtask.done = true
 		c.MapDone++
 		for i := range files {
-			tfile := c.ReduceTask[i].files
+			ridx, err := strconv.Atoi(files[i][len(files[i])-1:])
+			if err != nil {
+				log.Fatal(err)
+
+			}
+			tfile := c.ReduceTask[ridx].files
 			tfile = append(tfile, files[i])
-			c.ReduceTask[i] = task{files: tfile}
+			c.ReduceTask[ridx] = task{files: tfile}
 		}
 		c.MapTask[taskId] = mtask
+		if c.MapDone == len(c.MapTask) {
+			time.Sleep(10 * time.Second)
+		}
 	}
+
 	c.mu.Unlock()
 
 }
@@ -153,9 +161,10 @@ func (c *Coordinator) GetTask(getTask *GetTask, replyTask *ReplyTask) error {
 			replyTask.Type = "Map"
 			mtask := c.MapTask[replyTask.TaskId]
 			replyTask.File = mtask.files
-			mtask.workerId = append(mtask.workerId, getTask.WorkerId)
 			mtask.timeStamp = time.Now()
 			c.MapTask[replyTask.TaskId] = mtask
+		} else {
+			replyTask.Type = "Wait"
 		}
 	} else if c.ReduceDone < len(c.ReduceTask) {
 		replyTask.TaskId = getPendingTask(c.ReduceTask)
@@ -163,10 +172,14 @@ func (c *Coordinator) GetTask(getTask *GetTask, replyTask *ReplyTask) error {
 			replyTask.Type = "Reduce"
 			rtask := c.ReduceTask[replyTask.TaskId]
 			replyTask.File = rtask.files
-			rtask.workerId = append(rtask.workerId, getTask.WorkerId)
 			rtask.timeStamp = time.Now()
 			c.ReduceTask[replyTask.TaskId] = rtask
+		} else {
+			replyTask.Type = "Wait"
 		}
+
+	} else {
+		replyTask.Type = "Exit"
 	}
 	c.mu.Unlock()
 	return nil
@@ -174,7 +187,7 @@ func (c *Coordinator) GetTask(getTask *GetTask, replyTask *ReplyTask) error {
 
 func getPendingTask(tasks map[int]task) int {
 	for taskId, task := range tasks {
-		if !task.done && (task.workerId == nil || task.timeStamp.Add(time.Duration(10)*time.Second).Before(time.Now())) {
+		if !task.done && (task.timeStamp.Add(time.Duration(10) * time.Second).Before(time.Now())) {
 			return taskId
 		}
 	}

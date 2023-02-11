@@ -32,10 +32,6 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-type worker struct {
-	Id int
-}
-
 //
 // main/mrworker.go calls this function.
 //
@@ -48,58 +44,51 @@ func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-	var wg sync.WaitGroup
 	// Your worker implementation here.
-	for i := 0; i < 9; i++ {
-		wg.Add(1)
-		go func(workerId int) {
-			defer wg.Done()
-			getTask := GetTask{workerId}
-			replyTask := ReplyTask{}
-			for !replyTask.Done {
-				success := call("Coordinator.GetTask", &getTask, &replyTask)
-				if success {
-					if replyTask.Type == "Map" {
-						maptask(mapf, replyTask.File, getTask.WorkerId, replyTask.TaskId, replyTask.NReduce)
-
-					} else if replyTask.Type == "Reduce" {
-						reducetask(reducef, replyTask.File, getTask.WorkerId, replyTask.TaskId)
-					} else {
-						time.Sleep(10 * time.Second)
-					}
-				}
-				replyTask = ReplyTask{}
+	getTask := GetTask{}
+	replyTask := ReplyTask{}
+	for !replyTask.Done {
+		success := call("Coordinator.GetTask", &getTask, &replyTask)
+		if success {
+			switch replyTask.Type {
+			case "Map":
+				maptask(mapf, replyTask.File, replyTask.TaskId, replyTask.NReduce)
+			case "Reduce":
+				reducetask(reducef, replyTask.File, replyTask.TaskId)
+			case "Wait":
+				time.Sleep(10 * time.Second)
+			case "Exit":
+				break
 			}
-
-		}(i)
+			replyTask = ReplyTask{}
+		}
 	}
-	wg.Wait()
 }
 
-func maptask(mapf func(string, string) []KeyValue, files []string, workerId int, taskId int, nReduce int) {
+func maptask(mapf func(string, string) []KeyValue, files []string, taskId int, nReduce int) {
 	kva, err := mapHelper(mapf, files[0])
 	if err != nil {
 		log.Fatal(err)
 	}
-	intermediatefiles, err := intermediateFileCreator(kva, workerId, taskId, nReduce)
+	intermediatefiles, err := intermediateFileCreator(kva, taskId, nReduce)
 	if err != nil {
 		log.Fatal(err)
 	}
-	reportTask("Coordinator.TaskReport", intermediatefiles, "Map", workerId, taskId)
+	reportTask("Coordinator.TaskReport", intermediatefiles, "Map", taskId)
 }
 
-func reducetask(reducef func(string, []string) string, files []string, workerId int, taskId int) {
+func reducetask(reducef func(string, []string) string, files []string, taskId int) {
 	OutputFile, err := reduceHelper(reducef, files, taskId)
 	if err != nil {
 		log.Fatal(err)
 	}
 	var ofile []string
 	ofile = append(ofile, OutputFile)
-	reportTask("Coordinator.TaskReport", ofile, "Reduce", workerId, taskId)
+	reportTask("Coordinator.TaskReport", ofile, "Reduce", taskId)
 }
 
-func reportTask(rpcName string, files []string, Type string, workerId int, taskId int) {
-	sendReport := SendTaskReport{true, files, workerId, taskId, Type}
+func reportTask(rpcName string, files []string, Type string, taskId int) {
+	sendReport := SendTaskReport{true, files, taskId, Type}
 	replyReport := ReplyTaskReport{}
 	success := call(rpcName, &sendReport, &replyReport)
 	if !success {
@@ -167,21 +156,20 @@ func reduceHelper(reducef func(string, []string) string, fileNames []string, tas
 
 }
 
-func intermediateFileCreator(kva []KeyValue, workerId int, taskId int, nReduce int) ([]string, error) {
+func intermediateFileCreator(kva []KeyValue, taskId int, nReduce int) ([]string, error) {
 	var intermediatefiles []string
 	fileContent := make(map[string][]KeyValue)
-	prefix := "mr-" + strconv.Itoa(workerId) + "-" + strconv.Itoa(taskId) + "-"
-	for i := 0; i < nReduce; i++ {
-		intermediatefiles = append(intermediatefiles, prefix+strconv.Itoa(i))
-	}
+	prefix := "mr-" + strconv.Itoa(taskId) + "-"
 	for idx := range kva {
 		kv := kva[idx]
 		hash := ihash(kv.Key) % nReduce
-		fileContent[intermediatefiles[hash]] = append(fileContent[intermediatefiles[hash]], kv)
+		fname := prefix + strconv.Itoa(hash)
+		fileContent[fname] = append(fileContent[fname], kv)
 	}
 	var wg sync.WaitGroup
 	for k, v := range fileContent {
 		wg.Add(1)
+		intermediatefiles = append(intermediatefiles, k)
 		go func(fileName string, data []KeyValue) {
 			defer wg.Done()
 			createFile(fileName, data)
@@ -189,7 +177,6 @@ func intermediateFileCreator(kva []KeyValue, workerId int, taskId int, nReduce i
 	}
 	wg.Wait()
 	return intermediatefiles, nil
-
 }
 
 func createFile(fileName string, data []KeyValue) {
