@@ -83,9 +83,11 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	//Persistent state on all server
-	currentTerm int `default:0`
-	votedFor    int `default:nil`
-	log         []logEntry
+	currentTerm   int `default:0`
+	votedFor      int `default:nil`
+	VoteTerm      int `default:0`
+	VoteTermVoted int `default:nil`
+	log           []logEntry
 
 	// Volatile state on all servers
 	commitIndex         int `default:0`
@@ -208,7 +210,7 @@ type AppendEntryReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.Term = args.Term
+	reply.Term = rf.currentTerm
 	if rf.currentTerm >= args.Term {
 		reply.VoteGranted = false
 		return
@@ -225,7 +227,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.Term = args.Term
+	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		return
@@ -242,7 +244,8 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 
 }
 
-func (rf *Raft) IsUpdate() {
+func (rf *Raft) IsUpdate(LastLogIndex int, LastLogTerm int) bool {
+	return false
 
 }
 
@@ -296,8 +299,7 @@ func (rf *Raft) KickStartElection() {
 	// lastLogTerm := rf.log[rf.commitIndex].Term
 	rf.mu.Unlock()
 
-	var mu sync.Mutex
-	cond := sync.NewCond(&mu)
+	cond := sync.NewCond(&rf.mu)
 
 	peerDone := 1
 	peerLength := len(rf.peers)
@@ -313,7 +315,7 @@ func (rf *Raft) KickStartElection() {
 			args := RequestVoteArgs{Term: term, CandidateId: candidateId}
 			reply := RequestVoteReply{}
 			rf.sendRequestVote(peer, &args, &reply)
-			mu.Lock()
+			rf.mu.Lock()
 			peerDone++
 			if reply.VoteGranted {
 				// DPrintf("term %v:%v me,%v peer", rf.currentTerm, rf.me, peer)
@@ -321,31 +323,24 @@ func (rf *Raft) KickStartElection() {
 				votefrom = append(votefrom, peer)
 			}
 			cond.Broadcast()
-			mu.Unlock()
+			rf.mu.Unlock()
 		}(peer)
 	}
 
-	mu.Lock()
+	rf.mu.Lock()
 	for {
-		rf.mu.Lock()
 		if rf.state != candidate {
-			rf.mu.Unlock()
 			break
-		} else {
-			rf.mu.Unlock()
-		}
-		if (peerLength - peerDone) < (majority - vote) {
+		} else if (peerLength - peerDone) < (majority - vote) {
 			break
-		}
-		if vote >= majority {
-			// DPrintf("%v leader, term %v", rf.me, rf.currentTerm)
+		} else if vote >= majority {
 			DPrintf("term:%v,leader:%v,%v", term, rf.me, votefrom)
 			rf.convertToLeader()
 			break
 		}
 		cond.Wait()
 	}
-	mu.Unlock()
+	rf.mu.Unlock()
 
 }
 
@@ -356,10 +351,8 @@ func (rf *Raft) convertToCandidate() {
 }
 
 func (rf *Raft) convertToLeader() {
-	rf.mu.Lock()
 	rf.state = leader
-	rf.mu.Unlock()
-	rf.sendEntry()
+	rf.lastAppendEntryTime = time.Now().Add(-AppendInterval)
 }
 
 func (rf *Raft) convertToFollower(term int, CandidateId int) {
@@ -374,8 +367,7 @@ func (rf *Raft) sendEntry() {
 	rf.lastAppendEntryTime = time.Now()
 	rf.mu.Unlock()
 
-	var mu sync.Mutex
-	cond := sync.NewCond(&mu)
+	cond := sync.NewCond(&rf.mu)
 
 	peerDone := 1
 	peerLength := len(rf.peers)
@@ -390,17 +382,17 @@ func (rf *Raft) sendEntry() {
 			args := AppendEntryArgs{Term: rf.currentTerm, LeaderId: rf.me}
 			reply := AppendEntryReply{}
 			rf.sendAppendEntry(peer, &args, &reply)
-			mu.Lock()
+			rf.mu.Lock()
 			peerDone++
 			if reply.Success {
 				success++
 			}
 			cond.Broadcast()
-			mu.Unlock()
+			rf.mu.Unlock()
 
 		}(peer)
 	}
-	mu.Lock()
+	rf.mu.Lock()
 	for {
 		if (peerLength - peerDone) < (majority - success) {
 			break
@@ -409,7 +401,7 @@ func (rf *Raft) sendEntry() {
 		}
 		cond.Wait()
 	}
-	mu.Unlock()
+	rf.mu.Unlock()
 }
 
 //
