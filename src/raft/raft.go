@@ -20,12 +20,16 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.824/labgob"
+	l "log"
+
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -83,11 +87,9 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	//Persistent state on all server
-	currentTerm   int `default:0`
-	votedFor      int `default:nil`
-	VoteTerm      int `default:0`
-	VoteTermVoted int `default:nil`
-	log           []logEntry
+	currentTerm int `default:0`
+	votedFor    int `default:nil`
+	log         []logEntry
 
 	// Volatile state on all servers
 	commitIndex         int `default:0`
@@ -124,6 +126,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -146,6 +155,18 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []logEntry
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		l.Fatal("Error occurs while decoding")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 //
@@ -187,7 +208,7 @@ type RequestVoteArgs struct {
 type RequestVoteReply struct {
 	// Your data here (2A).
 	Term        int
-	VoteGranted bool
+	VoteGranted bool `default:false`
 }
 
 type AppendEntryArgs struct {
@@ -201,7 +222,21 @@ type AppendEntryArgs struct {
 
 type AppendEntryReply struct {
 	Term    int
-	Success bool
+	Success bool `default: false`
+}
+
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	offset            int
+	data              []byte
+	done              bool `default:True`
+}
+
+type InstallSnapshotReply struct {
+	Term int
 }
 
 //
@@ -211,42 +246,52 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
 	if rf.currentTerm >= args.Term {
-		reply.VoteGranted = false
 		return
 	}
-	if true {
+	if rf.IsUpdate(args.LastLogIndex, args.LastLogTerm) {
 		rf.convertToFollower(args.Term, args.CandidateId)
 		DPrintf("term:%v, %v voted %v", args.Term, rf.me, args.CandidateId)
 		reply.VoteGranted = true
 		return
 	}
-	reply.VoteGranted = false
 }
 
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
+	reply.Success = false
 	if args.Term < rf.currentTerm {
-		reply.Success = false
 		return
 	}
-	if true {
-		if (args.Term > rf.currentTerm) || (args.Term == rf.currentTerm && rf.state == candidate) {
-			rf.convertToFollower(args.Term, args.LeaderId)
-		}
-		rf.lastAppendEntryTime = time.Now()
+	rf.lastAppendEntryTime = time.Now()
+	if (args.Term > rf.currentTerm) || (args.Term == rf.currentTerm && rf.votedFor != args.LeaderId) {
+		rf.convertToFollower(args.Term, args.LeaderId)
+	}
+	if rf.AppendCheck(args.PrevLogIndex, args.PrevLogTerm) {
 		reply.Success = true
 		return
 	}
-	reply.Success = false
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.Term = rf.currentTerm
+	if rf.currentTerm > args.Term {
+		return
+	}
 
 }
 
-func (rf *Raft) IsUpdate(LastLogIndex int, LastLogTerm int) bool {
-	return false
+func (rf *Raft) AppendCheck(PrevLogIndex int, PrevLogTerm int) bool {
+	return len(rf.log) > PrevLogIndex && rf.log[PrevLogIndex].Term == PrevLogTerm && rf.log[PrevLogIndex].Index == PrevLogIndex
+}
 
+func (rf *Raft) IsUpdate(LastLogIndex int, LastLogTerm int) bool {
+	return LastLogIndex >= rf.commitIndex && LastLogTerm >= rf.log[rf.commitIndex].Term
 }
 
 //
@@ -288,6 +333,11 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *Append
 	return ok
 }
 
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
 func (rf *Raft) KickStartElection() {
 
 	rf.mu.Lock()
@@ -295,8 +345,8 @@ func (rf *Raft) KickStartElection() {
 
 	term := rf.currentTerm
 	candidateId := rf.me
-	// lastLogIndex := rf.commitIndex
-	// lastLogTerm := rf.log[rf.commitIndex].Term
+	lastLogIndex := rf.commitIndex
+	lastLogTerm := rf.log[rf.commitIndex].Term
 	rf.mu.Unlock()
 
 	cond := sync.NewCond(&rf.mu)
@@ -305,14 +355,13 @@ func (rf *Raft) KickStartElection() {
 	peerLength := len(rf.peers)
 	majority := peerLength/2 + 1
 	vote := 1
-	var votefrom []int
 	// DPrintf("%v,%v:length of peers %v and majority needed %v", rf.me, rf.currentTerm, peerLength, majority)
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
 		}
 		go func(peer int) {
-			args := RequestVoteArgs{Term: term, CandidateId: candidateId}
+			args := RequestVoteArgs{term, candidateId, lastLogIndex, lastLogTerm}
 			reply := RequestVoteReply{}
 			rf.sendRequestVote(peer, &args, &reply)
 			rf.mu.Lock()
@@ -320,7 +369,6 @@ func (rf *Raft) KickStartElection() {
 			if reply.VoteGranted {
 				// DPrintf("term %v:%v me,%v peer", rf.currentTerm, rf.me, peer)
 				vote++
-				votefrom = append(votefrom, peer)
 			}
 			cond.Broadcast()
 			rf.mu.Unlock()
@@ -334,7 +382,6 @@ func (rf *Raft) KickStartElection() {
 		} else if (peerLength - peerDone) < (majority - vote) {
 			break
 		} else if vote >= majority {
-			DPrintf("term:%v,leader:%v,%v", term, rf.me, votefrom)
 			rf.convertToLeader()
 			break
 		}
@@ -361,10 +408,18 @@ func (rf *Raft) convertToFollower(term int, CandidateId int) {
 	rf.votedFor = CandidateId
 }
 
-func (rf *Raft) sendEntry() {
-
+func (rf *Raft) sendEntry() bool {
 	rf.mu.Lock()
 	rf.lastAppendEntryTime = time.Now()
+	term := rf.currentTerm
+	LeaderId := rf.me
+	PrevLogIndex := rf.commitIndex
+	PrevLogTerm := 0
+	leaderCommit := rf.commitIndex
+	lastEntryIndex := len(rf.log) - 1
+	if PrevLogTerm > 0 {
+		PrevLogTerm = rf.log[PrevLogTerm].Term
+	}
 	rf.mu.Unlock()
 
 	cond := sync.NewCond(&rf.mu)
@@ -379,29 +434,55 @@ func (rf *Raft) sendEntry() {
 			continue
 		}
 		go func(peer int) {
-			args := AppendEntryArgs{Term: rf.currentTerm, LeaderId: rf.me}
-			reply := AppendEntryReply{}
-			rf.sendAppendEntry(peer, &args, &reply)
-			rf.mu.Lock()
-			peerDone++
-			if reply.Success {
-				success++
+			for {
+				rf.mu.Lock()
+				entries := rf.getEntry(peer, lastEntryIndex)
+				rf.mu.Unlock()
+				args := AppendEntryArgs{term, LeaderId, PrevLogIndex, PrevLogTerm, entries, leaderCommit}
+				reply := AppendEntryReply{}
+				ok := rf.sendAppendEntry(peer, &args, &reply)
+				rf.mu.Lock()
+				if ok {
+					if !reply.Success {
+						rf.nextIndex[peer]--
+						rf.mu.Unlock()
+						continue
+					}
+					success++
+				}
+				peerDone++
+				cond.Broadcast()
+				rf.mu.Unlock()
+				break
 			}
-			cond.Broadcast()
-			rf.mu.Unlock()
-
 		}(peer)
 	}
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	for {
 		if (peerLength - peerDone) < (majority - success) {
-			break
+			return false
 		} else if success >= majority {
-			break
+			go rf.startCommit(lastEntryIndex)
+			return true
 		}
 		cond.Wait()
 	}
-	rf.mu.Unlock()
+
+}
+
+func (rf *Raft) getEntry(peer int, lastEntryIndex int) []logEntry {
+	return rf.log[rf.nextIndex[peer] : lastEntryIndex+1]
+}
+
+func (rf *Raft) startCommit(lastEntryIndex int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.commitIndex = lastEntryIndex
+}
+
+func (rf *Raft) applyEntry(applyCh chan ApplyMsg) {
+
 }
 
 //
@@ -421,10 +502,16 @@ func (rf *Raft) sendEntry() {
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
-
-	// Your code here (2B).
-
+	isLeader := false
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state == leader {
+		index = len(rf.log)
+		term = rf.currentTerm
+		isLeader = true
+		log := logEntry{term, index, command}
+		rf.log = append(rf.log, log)
+	}
 	return index, term, isLeader
 }
 
