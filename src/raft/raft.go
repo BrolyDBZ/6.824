@@ -36,11 +36,11 @@ import (
 type serverState string
 
 const (
-	leader         serverState   = "Leader"
-	follower       serverState   = "Follower"
-	candidate      serverState   = "Candidate"
-	MinElecTimout  int64         = 350
-	AppendInterval time.Duration = 120 * time.Millisecond
+	leader         serverState = "Leader"
+	follower       serverState = "Follower"
+	candidate      serverState = "Candidate"
+	MinElecTimout  int64       = 300
+	AppendInterval int64       = 120
 )
 
 type logEntry struct {
@@ -359,7 +359,6 @@ func (rf *Raft) KickStartElection() {
 	candidateId := rf.me
 	lastLogIndex := rf.commitIndex
 	lastLogTerm := -1
-	rf.lastAppendEntryTime = time.Now()
 	if lastLogIndex >= 0 {
 		lastLogTerm = rf.log[lastLogIndex].Term
 	}
@@ -404,6 +403,7 @@ func (rf *Raft) KickStartElection() {
 		}
 		cond.Wait()
 	}
+	rf.lastAppendEntryTime = time.Now()
 	rf.mu.Unlock()
 
 }
@@ -417,7 +417,7 @@ func (rf *Raft) convertToCandidate() {
 
 func (rf *Raft) convertToLeader() {
 	rf.state = leader
-	rf.lastAppendEntryTime = time.Now().Add(-AppendInterval)
+	rf.lastAppendEntryTime = time.Now().Add(-time.Duration(AppendInterval) * time.Microsecond)
 	rf.AssignNextIndex(len(rf.log))
 }
 
@@ -506,11 +506,13 @@ func (rf *Raft) sendEntry() bool {
 	defer rf.mu.Unlock()
 	for {
 		if rf.state != leader || (peerLength-peerDone) < (majority-success) {
+			rf.lastAppendEntryTime = time.Now()
 			return false
 		} else if success >= majority {
 			if rf.commitIndex < lastEntryIndex-1 {
 				go rf.startCommit(lastEntryIndex)
 			}
+			rf.lastAppendEntryTime = time.Now()
 			return true
 		}
 		cond.Wait()
@@ -612,10 +614,10 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		electionTimeOut := time.Duration(MinElecTimout+rand.Int63()%150) * time.Millisecond
+		electionTimeOut := MinElecTimout + rand.Int63()%200
 		time.Sleep(50 * time.Millisecond)
 		rf.mu.Lock()
-		if rf.lastAppendEntryTime.Add(electionTimeOut).Before(time.Now()) {
+		if time.Since(rf.lastAppendEntryTime).Milliseconds() >= electionTimeOut {
 			rf.mu.Unlock()
 			rf.KickStartElection()
 		} else {
@@ -628,7 +630,7 @@ func (rf *Raft) heartbeat() {
 	for rf.killed() == false {
 		time.Sleep(20 * time.Millisecond)
 		rf.mu.Lock()
-		if rf.state == leader && rf.lastAppendEntryTime.Add(AppendInterval).Before(time.Now()) {
+		if rf.state == leader && time.Since(rf.lastAppendEntryTime).Milliseconds() >= AppendInterval {
 			rf.mu.Unlock()
 			rf.sendEntry()
 		} else {
