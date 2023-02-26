@@ -254,7 +254,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	if rf.IsUpdate(args.LastLogIndex, args.LastLogTerm) {
 		rf.convertToFollower(args.Term, args.CandidateId)
-		// DPrintf("term:%v, %v voted %v", args.Term, rf.me, args.CandidateId)
 		reply.VoteGranted = true
 		return
 	}
@@ -360,6 +359,7 @@ func (rf *Raft) KickStartElection() {
 	candidateId := rf.me
 	lastLogIndex := rf.commitIndex
 	lastLogTerm := -1
+	rf.lastAppendEntryTime = time.Now()
 	if lastLogIndex >= 0 {
 		lastLogTerm = rf.log[lastLogIndex].Term
 	}
@@ -371,7 +371,6 @@ func (rf *Raft) KickStartElection() {
 	peerLength := len(rf.peers)
 	majority := peerLength/2 + 1
 	vote := 1
-	// DPrintf("%v,%v:length of peers %v and majority needed %v", rf.me, rf.currentTerm, peerLength, majority)
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
@@ -384,7 +383,6 @@ func (rf *Raft) KickStartElection() {
 			peerDone++
 			if ok {
 				if reply.VoteGranted {
-					// DPrintf("term %v:%v me,%v peer", rf.currentTerm, rf.me, peer)
 					vote++
 				} else if reply.Term > rf.currentTerm {
 					rf.convertToFollower(reply.Term, peer)
@@ -402,7 +400,6 @@ func (rf *Raft) KickStartElection() {
 			break
 		} else if vote >= majority {
 			rf.convertToLeader()
-			DPrintf("%v,%v", rf.me, rf.currentTerm)
 			break
 		}
 		cond.Wait()
@@ -444,7 +441,6 @@ func (rf *Raft) DestroyLeaderSession() {
 
 func (rf *Raft) sendEntry() bool {
 	rf.mu.Lock()
-	rf.lastAppendEntryTime = time.Now()
 	term := rf.currentTerm
 	LeaderId := rf.me
 	leaderCommit := rf.commitIndex
@@ -498,8 +494,6 @@ func (rf *Raft) sendEntry() bool {
 						success++
 						rf.nextIndex[peer] = lastEntryIndex
 					}
-				} else {
-					continue
 				}
 				peerDone++
 				cond.Broadcast()
@@ -515,7 +509,6 @@ func (rf *Raft) sendEntry() bool {
 			return false
 		} else if success >= majority {
 			if rf.commitIndex < lastEntryIndex-1 {
-				DPrintf("server:%v, agreementtil:%v", rf.me, lastEntryIndex-1)
 				go rf.startCommit(lastEntryIndex)
 			}
 			return true
@@ -538,7 +531,6 @@ func (rf *Raft) startCommit(lastEntryIndex int) {
 func (rf *Raft) applyEntry(applyCh chan ApplyMsg) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("%v,%v", rf.me, rf.commitIndex)
 	for rf.lastApplied < rf.commitIndex {
 		rf.lastApplied++
 		CommandIndex := rf.lastApplied
@@ -576,7 +568,6 @@ func (rf *Raft) UpdatePersistentState(term int, votedFor int, log []logEntry) {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	// DPrintf("%v,%v", rf.me, command)
 	index := -1
 	term := -1
 	isLeader := false
