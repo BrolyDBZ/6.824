@@ -274,13 +274,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	if (args.Term > rf.currentTerm) || (args.Term == rf.currentTerm && rf.votedFor != args.LeaderId) {
 		rf.convertToFollower(args.Term, args.LeaderId)
 	}
-	if args.PrevLogIndex == -1 {
-		DPrintf("%v,append", rf.me)
-	}
 	if rf.AppendCheck(args.PrevLogIndex, args.PrevLogTerm) && (rf.votedFor == args.LeaderId) {
-		if args.PrevLogIndex == -1 {
-			DPrintf("%v,appendIn", rf.me)
-		}
 		reply.Success = true
 		rf.log = rf.log[:args.PrevLogIndex+1]
 		rf.UpdatePersistentState(rf.currentTerm, rf.votedFor, args.Entries)
@@ -411,7 +405,6 @@ func (rf *Raft) KickStartElection() {
 			rf.convertToFollower(rf.currentTerm, nilInt)
 			break
 		} else if vote >= majority {
-			DPrintf("%v,%v", rf.currentTerm, rf.me)
 			rf.convertToLeader()
 			break
 		}
