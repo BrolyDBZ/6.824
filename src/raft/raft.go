@@ -164,9 +164,11 @@ func (rf *Raft) readPersist(data []byte) {
 	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
 		l.Fatal("Error occurs while decoding")
 	} else {
+		rf.mu.Lock()
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
+		rf.mu.Unlock()
 	}
 }
 
@@ -273,9 +275,11 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	}
 	if rf.AppendCheck(args.PrevLogIndex, args.PrevLogTerm) {
 		reply.Success = true
-		rf.commitIndex = args.LeaderCommit
+		if rf.commitIndex < args.LeaderCommit {
+			rf.startCommit(args.LeaderCommit)
+		}
 		rf.log = rf.log[:args.PrevLogIndex+1]
-		rf.log = append(rf.log, args.Entries...)
+		rf.UpdatePersistentState(rf.currentTerm, rf.votedFor, args.Entries)
 		go rf.applyEntry(rf.applyCh)
 		return
 	}
@@ -300,10 +304,11 @@ func (rf *Raft) AppendCheck(PrevLogIndex int, PrevLogTerm int) bool {
 
 func (rf *Raft) IsUpdate(LastLogIndex int, LastLogTerm int) bool {
 	term := -1
-	if rf.commitIndex >= 0 {
-		term = rf.log[rf.commitIndex].Term
+	index := len(rf.log) - 1
+	if index >= 0 {
+		term = rf.log[index].Term
 	}
-	return LastLogIndex >= rf.commitIndex && LastLogTerm >= term
+	return (LastLogTerm > term) || (LastLogTerm == term && LastLogIndex >= index)
 }
 
 //
@@ -357,7 +362,7 @@ func (rf *Raft) KickStartElection() {
 
 	term := rf.currentTerm
 	candidateId := rf.me
-	lastLogIndex := rf.commitIndex
+	lastLogIndex := len(rf.log) - 1
 	lastLogTerm := -1
 	if lastLogIndex >= 0 {
 		lastLogTerm = rf.log[lastLogIndex].Term
@@ -409,10 +414,9 @@ func (rf *Raft) KickStartElection() {
 }
 
 func (rf *Raft) convertToCandidate() {
-	rf.currentTerm++
 	rf.state = candidate
-	rf.votedFor = rf.me
 	rf.DestroyLeaderSession()
+	rf.UpdatePersistentState(rf.currentTerm+1, rf.me, nil)
 }
 
 func (rf *Raft) convertToLeader() {
@@ -423,8 +427,7 @@ func (rf *Raft) convertToLeader() {
 
 func (rf *Raft) convertToFollower(term int, CandidateId int) {
 	rf.state = follower
-	rf.currentTerm = term
-	rf.votedFor = CandidateId
+	rf.UpdatePersistentState(term, CandidateId, nil)
 	rf.DestroyLeaderSession()
 }
 
@@ -506,11 +509,10 @@ func (rf *Raft) sendEntry() bool {
 	defer rf.mu.Unlock()
 	for {
 		if rf.state != leader || (peerLength-peerDone) < (majority-success) {
-			rf.lastAppendEntryTime = time.Now()
 			return false
 		} else if success >= majority {
 			if rf.commitIndex < lastEntryIndex-1 {
-				go rf.startCommit(lastEntryIndex)
+				rf.startCommit(lastEntryIndex - 1)
 			}
 			rf.lastAppendEntryTime = time.Now()
 			return true
@@ -523,10 +525,8 @@ func (rf *Raft) getEntry(peer int, lastEntryIndex int) []logEntry {
 	return rf.log[rf.nextIndex[peer]:lastEntryIndex]
 }
 
-func (rf *Raft) startCommit(lastEntryIndex int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.commitIndex = lastEntryIndex - 1
+func (rf *Raft) startCommit(CommitIndex int) {
+	rf.commitIndex = CommitIndex
 	go rf.applyEntry(rf.applyCh)
 }
 
@@ -541,18 +541,21 @@ func (rf *Raft) applyEntry(applyCh chan ApplyMsg) {
 	}
 }
 
-func (rf *Raft) savePersistent() {
-	for {
-		// Your Implementation for storing persistent storage if their is any changes
-
-	}
-}
+// func (rf *Raft) savePersistent() {
+// 	for {
+// 		// Your Implementation for storing persistent storage if their is any changes
+// 		rf.persistentMu.Lock()
+// 		rf.persistentCond.Wait()
+// 		rf.persist()
+// 		rf.persistentMu.Unlock()
+// 	}
+// }
 
 func (rf *Raft) UpdatePersistentState(term int, votedFor int, log []logEntry) {
-
 	rf.currentTerm = term
 	rf.votedFor = votedFor
 	rf.log = append(rf.log, log...)
+	rf.persist()
 }
 
 //
@@ -579,8 +582,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		index = len(rf.log)
 		term = rf.currentTerm
 		isLeader = true
-		log := logEntry{term, index, command}
-		rf.log = append(rf.log, log)
+		var log []logEntry
+		log = append(log, logEntry{term, index, command})
+		rf.UpdatePersistentState(term, rf.votedFor, log)
 	}
 	return index + 1, term, isLeader
 }
@@ -668,11 +672,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
 	go rf.heartbeat()
+
+	// go rf.savePersistent()
 
 	return rf
 }
