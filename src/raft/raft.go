@@ -524,7 +524,13 @@ func (rf *Raft) sendEntry() bool {
 }
 
 func (rf *Raft) getEntry(peer int, lastEntryIndex int) []logEntry {
-	return rf.log[rf.nextIndex[peer]:lastEntryIndex]
+	var entries []logEntry
+	for i := rf.nextIndex[peer]; i < lastEntryIndex; i++ {
+		rf.log[i].Term = rf.currentTerm
+		entries = append(entries, rf.log[i])
+	}
+	return entries
+	// return rf.log[rf.nextIndex[peer]:lastEntryIndex]
 }
 
 func (rf *Raft) startCommit(CommitIndex int) {
