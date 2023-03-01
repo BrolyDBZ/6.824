@@ -104,6 +104,11 @@ type Raft struct {
 	//Volatile state on leader
 	nextIndex  []int
 	matchIndex []int
+
+	// term for snapshot
+	SnapshotData  []byte
+	SnapshotTerm  int
+	SnapshotIndex int
 }
 
 // return currentTerm and whether this server
@@ -276,7 +281,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	}
 	if rf.AppendCheck(args.PrevLogIndex, args.PrevLogTerm) && (rf.votedFor == args.LeaderId) {
 		reply.Success = true
-		rf.log = rf.log[:args.PrevLogIndex+1]
+		rf.log = rf.getEntryUpTo(args.PrevLogIndex)
 		rf.UpdatePersistentState(rf.currentTerm, rf.votedFor, args.Entries)
 		if rf.commitIndex < args.LeaderCommit {
 			rf.startCommit(args.LeaderCommit)
@@ -298,15 +303,23 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 func (rf *Raft) AppendCheck(PrevLogIndex int, PrevLogTerm int) bool {
 	if PrevLogIndex == nilInt {
 		return true
+	} else if rf.SnapshotIndex == PrevLogIndex {
+		return PrevLogTerm == rf.SnapshotTerm
 	}
-	return len(rf.log) > PrevLogIndex && rf.log[PrevLogIndex].Term == PrevLogTerm && rf.log[PrevLogIndex].Index == PrevLogIndex
+	firstLogIndex := -1
+	LastLogIndex := -1
+	if len(rf.log) > 0 {
+		firstLogIndex = rf.log[0].Index
+		LastLogIndex = rf.log[len(rf.log)-1].Index
+	}
+	return LastLogIndex >= PrevLogIndex && rf.log[PrevLogIndex-firstLogIndex].Term == PrevLogTerm && rf.log[PrevLogIndex-firstLogIndex].Index == PrevLogIndex
 }
 
 func (rf *Raft) IsUpdate(LastLogIndex int, LastLogTerm int) bool {
 	term := nilInt
-	index := len(rf.log) - 1
+	index := rf.getLogIndex(len(rf.log) - 1)
 	if index >= 0 {
-		term = rf.log[index].Term
+		term = rf.getIndexTerm(index)
 	}
 	return (LastLogTerm > term) || (LastLogTerm == term && LastLogIndex >= index)
 }
@@ -362,10 +375,10 @@ func (rf *Raft) KickStartElection() {
 
 	term := rf.currentTerm
 	candidateId := rf.me
-	lastLogIndex := len(rf.log) - 1
+	lastLogIndex := rf.getLogIndex(len(rf.log) - 1)
 	lastLogTerm := nilInt
 	if lastLogIndex >= 0 {
-		lastLogTerm = rf.log[lastLogIndex].Term
+		lastLogTerm = rf.getIndexTerm(lastLogIndex)
 	}
 	rf.mu.Unlock()
 
@@ -441,6 +454,23 @@ func (rf *Raft) AssignNextIndex(nextIndex int) {
 func (rf *Raft) DestroyLeaderSession() {
 	rf.nextIndex = nil
 	rf.matchIndex = nil
+}
+
+func (rf *Raft) getLogIndex(Index int) int {
+	if Index == -1 {
+		return rf.SnapshotIndex
+	}
+	return rf.log[Index].Index
+}
+
+func (rf *Raft) getIndexTerm(Index int) int {
+	if Index == -1 {
+		return -1
+	} else if rf.SnapshotIndex == Index {
+		return rf.SnapshotIndex
+	}
+	firstLogIndex := rf.log[0].Index
+	return rf.log[Index-firstLogIndex].Term
 }
 
 func (rf *Raft) sendEntry() bool {
@@ -523,6 +553,17 @@ func (rf *Raft) sendEntry() bool {
 	}
 }
 
+func (rf *Raft) getEntryUpTo(Index int) []logEntry {
+	if len(rf.log) == 0 {
+		return nil
+	}
+	firstIndex := rf.log[0].Index
+	if rf.log[0].Index > Index {
+		return nil
+	}
+	return rf.log[:Index-firstIndex+1]
+}
+
 func (rf *Raft) getEntry(peer int, lastEntryIndex int) []logEntry {
 	var entries []logEntry
 	for i := rf.nextIndex[peer]; i < lastEntryIndex; i++ {
@@ -542,10 +583,11 @@ func (rf *Raft) applyEntry(applyCh chan ApplyMsg) {
 	// rf.mu.Lock()
 	// defer rf.mu.Unlock()
 	// DPrintf("%v,%v,%v,%v", rf.me, rf.lastApplied, rf.commitIndex, rf.log)
+	firstIndex := rf.log[0].Index
 	for rf.lastApplied < rf.commitIndex {
 		rf.lastApplied++
 		// DPrintf("%v,%v applied", rf.me, rf.lastApplied)
-		CommandIndex := rf.lastApplied
+		CommandIndex := rf.lastApplied - firstIndex
 		applyLog := ApplyMsg{CommandValid: true, Command: rf.log[CommandIndex].Command, CommandIndex: CommandIndex + 1}
 		applyCh <- applyLog
 	}
@@ -589,7 +631,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.state == leader {
-		index = len(rf.log)
+		index = rf.getLogIndex(len(rf.log)-1) + 1
 		term = rf.currentTerm
 		isLeader = true
 		var log []logEntry
@@ -676,6 +718,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		applyCh:             applyCh,
 		commitIndex:         nilInt,
 		lastApplied:         nilInt,
+		SnapshotTerm:        nilInt,
+		SnapshotIndex:       nilInt,
 	}
 
 	// Your initialization code here (2A, 2B, 2C).
