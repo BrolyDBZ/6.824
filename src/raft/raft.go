@@ -436,7 +436,7 @@ func (rf *Raft) convertToCandidate() {
 func (rf *Raft) convertToLeader() {
 	rf.state = leader
 	rf.lastAppendEntryTime = time.Now().Add(-time.Duration(AppendInterval) * time.Microsecond)
-	rf.AssignNextIndex(len(rf.log))
+	rf.AssignNextIndex(rf.getLogIndex(len(rf.log)-1) + 1)
 }
 
 func (rf *Raft) convertToFollower(term int, CandidateId int) {
@@ -478,7 +478,7 @@ func (rf *Raft) sendEntry() bool {
 	term := rf.currentTerm
 	LeaderId := rf.me
 	leaderCommit := rf.commitIndex
-	lastEntryIndex := len(rf.log)
+	lastEntryIndex := rf.getLogIndex(len(rf.log)-1) + 1
 	rf.mu.Unlock()
 
 	cond := sync.NewCond(&rf.mu)
@@ -504,7 +504,7 @@ func (rf *Raft) sendEntry() bool {
 				PrevLogIndex := rf.nextIndex[peer] - 1
 				PrevLogTerm := nilInt
 				if PrevLogIndex >= 0 {
-					PrevLogTerm = rf.log[PrevLogIndex].Term
+					PrevLogTerm = rf.getIndexTerm(PrevLogIndex)
 				}
 				rf.mu.Unlock()
 				args := AppendEntryArgs{term, LeaderId, PrevLogIndex, PrevLogTerm, entries, leaderCommit}
@@ -567,8 +567,9 @@ func (rf *Raft) getEntryUpTo(Index int) []logEntry {
 func (rf *Raft) getEntry(peer int, lastEntryIndex int) []logEntry {
 	var entries []logEntry
 	for i := rf.nextIndex[peer]; i < lastEntryIndex; i++ {
-		rf.log[i].Term = rf.currentTerm
-		entries = append(entries, rf.log[i])
+		firstLogIndex := rf.log[0].Index
+		rf.log[i-firstLogIndex].Term = rf.currentTerm
+		entries = append(entries, rf.log[i-firstLogIndex])
 	}
 	return entries
 	// return rf.log[rf.nextIndex[peer]:lastEntryIndex]
