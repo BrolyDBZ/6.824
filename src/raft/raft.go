@@ -205,11 +205,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 	// rf.mu.Lock()
 
-	snapPersist := new(bytes.Buffer)
-	snapEncoder := labgob.NewEncoder(snapPersist)
-	snapEncoder.Encode(index)
-	snapEncoder.Encode(snapshot)
-	SnapshotData := snapPersist.Bytes()
 	go func(index int, data []byte) {
 		rf.mu.Lock()
 
@@ -218,11 +213,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 			term := rf.log[logIndex].Term
 			rf.log = rf.log[logIndex+1:]
 			rf.UpdatePersistentState(term, rf.votedFor, nil, term, index-1)
-			rf.persister.SaveStateAndSnapshot(rf.GetPersistedState(), SnapshotData)
+			rf.persister.SaveStateAndSnapshot(rf.GetPersistedState(), snapshot)
 		}
 
 		rf.mu.Unlock()
-	}(index, SnapshotData)
+	}(index, snapshot)
 
 	// rf.mu.Unlock()
 
@@ -328,10 +323,13 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if rf.currentTerm > args.Term {
 		return
 	}
+	rf.log = nil
+	rf.lastApplied = args.LastIncludedIndex
+	rf.commitIndex = args.LastIncludedIndex
 	rf.UpdatePersistentState(rf.currentTerm, rf.votedFor, nil, args.LastIncludedTerm, args.LastIncludedIndex)
 	rf.persister.SaveStateAndSnapshot(rf.GetPersistedState(), args.Data)
+	rf.applyCh <- ApplyMsg{SnapshotValid: true, Snapshot: args.Data, SnapshotTerm: args.LastIncludedTerm, SnapshotIndex: args.LastIncludedIndex + 1}
 	rf.lastAppendEntryTime = time.Now()
-
 }
 
 func (rf *Raft) AppendCheck(PrevLogIndex int, PrevLogTerm int) bool {
@@ -501,14 +499,13 @@ func (rf *Raft) getIndexTerm(Index int) int {
 	if Index == -1 {
 		return -1
 	} else if rf.SnapshotIndex == Index {
-		return rf.SnapshotIndex
+		return rf.SnapshotTerm
 	}
 	firstLogIndex := rf.log[0].Index
 	return rf.log[Index-firstLogIndex].Term
 }
 
 func (rf *Raft) sendEntry() bool {
-	t := time.Now()
 	rf.mu.Lock()
 	term := rf.currentTerm
 	LeaderId := rf.me
@@ -529,15 +526,12 @@ func (rf *Raft) sendEntry() bool {
 		}
 		go func(peer int) {
 			for {
-				PrevLogTerm := nilInt
-				snapOk := true
-				var entries []logEntry
 				rf.mu.Lock()
 				if rf.state == leader && rf.nextIndex[peer] <= rf.SnapshotIndex {
 					snapdata := rf.persister.ReadSnapshot()
 					snapArgs := InstallSnapshotArgs{rf.currentTerm, rf.me, rf.SnapshotIndex, rf.SnapshotTerm, 0, snapdata, true}
 					snapReply := InstallSnapshotReply{}
-
+					snapshotIndex := rf.SnapshotIndex
 					rf.mu.Unlock()
 					snapOk := rf.sendInstallSnapshot(peer, &snapArgs, &snapReply)
 					if snapOk {
@@ -546,15 +540,16 @@ func (rf *Raft) sendEntry() bool {
 						if snapReply.Term > rf.currentTerm {
 							rf.convertToFollower(snapReply.Term, nilInt)
 						} else if rf.state == leader {
-							rf.nextIndex[peer] = rf.SnapshotIndex + 1
+							rf.nextIndex[peer] = snapshotIndex + 1
 							rf.mu.Unlock()
 							continue
 						}
 						rf.mu.Unlock()
 					}
-				} else if snapOk && rf.state == leader {
+				} else if rf.state == leader {
 					PrevLogIndex := rf.nextIndex[peer] - 1
-					entries = rf.getEntry(peer, lastEntryIndex)
+					PrevLogTerm := nilInt
+					entries := rf.getEntry(peer, lastEntryIndex)
 					if PrevLogIndex >= 0 {
 						PrevLogTerm = rf.getIndexTerm(PrevLogIndex)
 					}
@@ -730,7 +725,7 @@ func (rf *Raft) ticker() {
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 		electionTimeOut := MinElecTimout + int64(rand.Intn(150))
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 		rf.mu.Lock()
 		if time.Since(rf.lastAppendEntryTime).Milliseconds() >= electionTimeOut {
 			rf.mu.Unlock()
@@ -782,9 +777,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.commitIndex = rf.SnapshotIndex
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.mu.Lock()
+	rf.commitIndex = rf.SnapshotIndex
+	rf.lastApplied = rf.SnapshotIndex
+	rf.mu.Unlock()
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
