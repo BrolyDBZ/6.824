@@ -40,7 +40,7 @@ const (
 	follower       serverState = "Follower"
 	candidate      serverState = "Candidate"
 	MinElecTimout  int64       = 360
-	AppendInterval int64       = 120
+	AppendInterval int64       = 100
 	nilInt         int         = -1
 )
 
@@ -208,7 +208,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	go func(index int, data []byte) {
 		rf.mu.Lock()
 
-		if rf.log != nil && rf.log[0].Index < index {
+		if len(rf.log) > 0 && rf.log[0].Index < index {
 			logIndex := index - rf.log[0].Index - 1
 			term := rf.log[logIndex].Term
 			rf.log = rf.log[logIndex+1:]
@@ -255,8 +255,10 @@ type AppendEntryArgs struct {
 }
 
 type AppendEntryReply struct {
-	Term    int
-	Success bool `default: false`
+	Term          int
+	Success       bool `default: false`
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 type InstallSnapshotArgs struct {
@@ -303,6 +305,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	if (args.Term > rf.currentTerm) || (args.Term == rf.currentTerm && rf.votedFor != args.LeaderId) {
 		rf.convertToFollower(args.Term, args.LeaderId)
 	}
+	rf.lastAppendEntryTime = time.Now()
 	if rf.AppendCheck(args.PrevLogIndex, args.PrevLogTerm) && (rf.votedFor == args.LeaderId) {
 		reply.Success = true
 		rf.log = rf.getEntryUpTo(args.PrevLogIndex)
@@ -310,10 +313,23 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		if rf.commitIndex < args.LeaderCommit {
 			rf.startCommit(args.LeaderCommit)
 		}
-		rf.lastAppendEntryTime = time.Now()
 		return
 	}
-	rf.lastAppendEntryTime = time.Now()
+	reply.ConflictIndex, reply.ConflictTerm = rf.GetConflictIndexTerm(args.PrevLogIndex)
+
+}
+
+func (rf *Raft) GetConflictIndexTerm(PrevLogIndex int) (int, int) {
+	if len(rf.log) == 0 {
+		return rf.SnapshotIndex, rf.SnapshotTerm
+	}
+	lastLogIndex := rf.log[len(rf.log)-1].Index
+	if PrevLogIndex > lastLogIndex {
+		return lastLogIndex, nilInt
+	}
+	firstIndex := rf.log[0].Index
+	return PrevLogIndex, rf.log[PrevLogIndex-firstIndex].Term
+
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
@@ -431,10 +447,10 @@ func (rf *Raft) KickStartElection() {
 			rf.mu.Lock()
 			peerDone++
 			if ok {
-				if reply.VoteGranted {
-					vote++
-				} else if reply.Term > rf.currentTerm {
+				if reply.Term > rf.currentTerm {
 					rf.convertToFollower(reply.Term, nilInt)
+				} else if args.Term == rf.currentTerm && reply.VoteGranted {
+					vote++
 				}
 			}
 
@@ -454,7 +470,6 @@ func (rf *Raft) KickStartElection() {
 		}
 		cond.Wait()
 	}
-	rf.lastAppendEntryTime = time.Now()
 	rf.mu.Unlock()
 
 }
@@ -467,8 +482,8 @@ func (rf *Raft) convertToCandidate() {
 
 func (rf *Raft) convertToLeader() {
 	rf.state = leader
-	rf.lastAppendEntryTime = time.Now().Add(-time.Duration(AppendInterval) * time.Millisecond)
 	rf.AssignNextIndex(rf.getLogIndex(len(rf.log)-1) + 1)
+	go rf.sendEntry()
 }
 
 func (rf *Raft) convertToFollower(term int, CandidateId int) {
@@ -559,15 +574,15 @@ func (rf *Raft) sendEntry() bool {
 					ok := rf.sendAppendEntry(peer, &args, &reply)
 					if ok {
 						rf.mu.Lock()
-						if rf.state != leader {
+						if rf.state != leader || args.Term != rf.currentTerm || PrevLogIndex != rf.nextIndex[peer]-1 {
 							rf.mu.Unlock()
-							continue
+							break
 						}
 						if !reply.Success {
 							if reply.Term > rf.currentTerm {
 								rf.convertToFollower(reply.Term, nilInt)
 							} else {
-								rf.nextIndex[peer]--
+								rf.DecrementIndex(peer, reply.ConflictIndex, reply.ConflictTerm)
 								rf.mu.Unlock()
 								continue
 							}
@@ -580,30 +595,42 @@ func (rf *Raft) sendEntry() bool {
 				} else {
 					rf.mu.Unlock()
 				}
-				rf.mu.Lock()
-				peerDone++
-				cond.Broadcast()
-				rf.mu.Unlock()
 				break
-
 			}
+			rf.mu.Lock()
+			peerDone++
+			cond.Broadcast()
+			rf.mu.Unlock()
 		}(peer)
 	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	for {
 		if rf.state != leader || (peerLength-peerDone) < (majority-success) {
-			rf.lastAppendEntryTime = time.Now()
 			return false
 		} else if success >= majority {
 			if rf.commitIndex < lastEntryIndex-1 {
 				rf.startCommit(lastEntryIndex - 1)
 			}
-			rf.lastAppendEntryTime = time.Now()
 			return true
 		}
 		cond.Wait()
 	}
+}
+
+func (rf *Raft) DecrementIndex(peer int, ConflictIndex int, ConflictTerm int) {
+	LastEntryWConflictTerm := nilInt
+	if ConflictTerm != nilInt {
+		for i := 0; i < len(rf.log); i++ {
+			if rf.log[i].Term == ConflictTerm {
+				LastEntryWConflictTerm = rf.log[i].Index
+			}
+		}
+	}
+	if LastEntryWConflictTerm != nilInt {
+		rf.nextIndex[peer] = LastEntryWConflictTerm + 1
+	}
+	rf.nextIndex[peer] = ConflictIndex
 }
 
 func (rf *Raft) getEntryUpTo(Index int) []logEntry {
@@ -630,15 +657,15 @@ func (rf *Raft) getEntry(peer int, lastEntryIndex int) []logEntry {
 
 func (rf *Raft) startCommit(CommitIndex int) {
 	rf.commitIndex = CommitIndex
-	rf.applyEntry(rf.applyCh)
+	go rf.applyEntry(rf.applyCh)
 }
 
 func (rf *Raft) applyEntry(applyCh chan ApplyMsg) {
-	// rf.mu.Lock()
-	// defer rf.mu.Unlock()
-	firstIndex := rf.log[0].Index
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	for rf.lastApplied < rf.commitIndex {
 		rf.lastApplied++
+		firstIndex := rf.log[0].Index
 		CommandIndex := rf.lastApplied - firstIndex
 		applyLog := ApplyMsg{CommandValid: true, Command: rf.log[CommandIndex].Command, CommandIndex: CommandIndex + firstIndex + 1}
 		applyCh <- applyLog
@@ -724,12 +751,19 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		electionTimeOut := MinElecTimout + int64(rand.Intn(150))
-		time.Sleep(10 * time.Millisecond)
+		electionTimeOut := MinElecTimout + int64(rand.Intn(240))
+		sleepTime := time.Until(rf.lastAppendEntryTime.Add(time.Duration(electionTimeOut) * time.Millisecond))
+		time.Sleep(sleepTime)
 		rf.mu.Lock()
-		if time.Since(rf.lastAppendEntryTime).Milliseconds() >= electionTimeOut {
+		if rf.state == leader {
+			rf.lastAppendEntryTime = time.Now()
 			rf.mu.Unlock()
-			rf.KickStartElection()
+
+		} else if time.Since(rf.lastAppendEntryTime).Milliseconds() >= electionTimeOut {
+			rf.lastAppendEntryTime = time.Now()
+			go rf.KickStartElection()
+			rf.mu.Unlock()
+
 		} else {
 			rf.mu.Unlock()
 		}
@@ -738,11 +772,13 @@ func (rf *Raft) ticker() {
 
 func (rf *Raft) heartbeat() {
 	for rf.killed() == false {
-		time.Sleep(10 * time.Millisecond)
+		sleepTime := time.Until(rf.lastAppendEntryTime.Add(time.Duration(AppendInterval) * time.Millisecond))
+		time.Sleep(sleepTime)
 		rf.mu.Lock()
 		if rf.state == leader && time.Since(rf.lastAppendEntryTime).Milliseconds() >= AppendInterval {
+			rf.lastAppendEntryTime = time.Now()
+			go rf.sendEntry()
 			rf.mu.Unlock()
-			rf.sendEntry()
 		} else {
 			rf.mu.Unlock()
 		}
@@ -768,7 +804,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		me:        me,
 
 		state:               follower,
-		lastAppendEntryTime: time.Now(),
+		lastAppendEntryTime: time.Now().Add(-(150 * time.Millisecond)),
 		applyCh:             applyCh,
 		commitIndex:         nilInt,
 		lastApplied:         nilInt,
